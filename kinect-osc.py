@@ -663,9 +663,16 @@ def main():
                 lm_dict[lm_name] = [lm.x, lm.y]
             dtw_matcher.push_frame(time.time(), lm_dict)
             dtw_name, dtw_score, is_trigger = dtw_matcher.match()
+            # 每個手勢獨立的 trigger path
+            # /dtw/wave 1, /dtw/circle 0, ...
+            for gname in dtw_matcher.templates:
+                if is_trigger and gname == dtw_name:
+                    osc.send_message(f"/dtw/{gname}", 1)
+                else:
+                    osc.send_message(f"/dtw/{gname}", 0)
+            # 同時也送通用的
             osc.send_message("/dtw/gesture", dtw_name)
             osc.send_message("/dtw/score", dtw_score)
-            osc.send_message("/dtw/trigger", int(is_trigger))
             if not args.no_preview:
                 draw_dtw(frame, dtw_name, dtw_score, is_trigger)
 
