@@ -1,66 +1,43 @@
 #!/usr/bin/env python3
 """
-Azure Kinect DK → MediaPipe → OSC
+Azure Kinect DK → MediaPipe → OSC (雙向)
 
 用法:
     source ~/azure-kinect-osc/bin/activate
-
-    # 即時追蹤
     python kinect-osc.py                        # 預設：姿態 + 手勢
-    python kinect-osc.py --pose --dtw           # 骨架 + DTW 動態手勢辨識
-    python kinect-osc.py --pose --rules         # 骨架 + 規則姿態偵測
+    python kinect-osc.py --pose --dtw --rules   # 骨架 + DTW + 規則
     python kinect-osc.py --all                  # 全部功能
-
-    # 錄製 DTW 手勢範本
-    python kinect-osc.py --record wave          # 錄製 "wave" 手勢（3 秒）
-    python kinect-osc.py --record circle --duration 4
     python kinect-osc.py --list-gestures        # 列出已錄製的手勢
 
-OSC 輸出:
-
-  姿態 --pose:
-    /pose/detected          0 或 1
-    /pose/nose              x y z
-    /pose/left_wrist        x y z
-    ...（共 17 個主要關節）
-
-  靜態手勢 --gesture:
-    /gesture/left           手勢名 (Open_Palm, Closed_Fist, Victory, ...)
-    /gesture/right          手勢名
-    /gesture/left/score     0.0~1.0
-    /gesture/right/score    0.0~1.0
-
-  DTW 動態手勢 --dtw (需搭配 --pose):
-    /dtw/gesture            辨識到的手勢名稱 (wave, circle, ... 或 none)
-    /dtw/score              DTW 距離（越小越像，< threshold 才觸發）
-    /dtw/trigger            1（觸發瞬間）或 0
-
-  規則姿態 --rules (需搭配 --pose):
-    /rule/arms_up           0 或 1（雙手高舉過頭）
-    /rule/left_arm_up       0 或 1
-    /rule/right_arm_up      0 或 1
-    /rule/squat             0 或 1（蹲下）
-    /rule/lean_left         0 或 1（身體左傾）
-    /rule/lean_right        0 或 1（身體右傾）
-    /rule/hands_together    0 或 1（雙手靠近）
-    /rule/jump              1（跳躍瞬間觸發）
-
-  臉部 --face:
-    /face/detected          0 或 1
-    /face/nose_tip          x y z
-    /face/left_eye          x y z
-    /face/right_eye         x y z
-    /face/mouth_center      x y z
-    /face/forehead          x y z
-    /face/chin              x y z
-
-  通用:
+OSC 送出 (→ Max/TD，預設 port 9000):
+    /pose/{joint}           x y z       17 個關節
+    /gesture/left           string      靜態手勢名
+    /gesture/right          string
+    /dtw/gesture            string      動態手勢名
+    /dtw/trigger            0 或 1      觸發瞬間
+    /rule/{name}            0 或 1      規則姿態
+    /face/{point}           x y z       6 個臉部點
+    /rec/status             string      錄製狀態 (idle/countdown/recording/saved)
+    /rec/progress           float       錄製進度 0.0~1.0
     /fps                    float
+
+OSC 接收 (← Max/TD，預設 port 9001):
+    /cmd/record <name>                  開始錄製手勢（預設 3 秒）
+    /cmd/record <name> <duration>       指定秒數
+    /cmd/record/stop                    提前停止錄製
+    /cmd/reload                         重新載入手勢範本
+    /cmd/threshold <float>              調整 DTW 閾值
+
+鍵盤快捷鍵（預覽視窗 focus 時）:
+    R       開始/停止錄製（名稱自動編號 gesture_001, 002...）
+    1-5     快速錄製 gesture_1 ~ gesture_5
+    Q       結束
 """
 
 import argparse
 import json
 import math
+import threading
 import time
 import sys
 import os
@@ -70,6 +47,8 @@ import cv2
 import numpy as np
 import mediapipe as mp
 from pythonosc import udp_client
+from pythonosc.dispatcher import Dispatcher
+from pythonosc.osc_server import ThreadingOSCUDPServer
 
 BaseOptions = mp.tasks.BaseOptions
 VisionRunningMode = mp.tasks.vision.RunningMode
@@ -78,7 +57,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
 GESTURES_DIR = os.path.join(SCRIPT_DIR, "gestures")
 
-# ── Pose landmark 名稱對照 ──
+# ── Landmark 名稱 ──
 
 POSE_LANDMARK_NAMES = {
     0:  "nose",
@@ -92,7 +71,6 @@ POSE_LANDMARK_NAMES = {
     27: "left_ankle",     28: "right_ankle",
 }
 
-# DTW 追蹤用的關鍵 landmark（用於手勢辨識的軌跡）
 DTW_TRACK_LANDMARKS = {
     15: "left_wrist",
     16: "right_wrist",
@@ -110,36 +88,30 @@ FACE_LANDMARK_NAMES = {
 
 
 # ════════════════════════════════════════════════════
-#  DTW 動態手勢辨識
+#  DTW
 # ════════════════════════════════════════════════════
 
 def dtw_distance(seq_a, seq_b):
-    """計算兩條軌跡的 DTW 距離（純 Python，無需額外套件）"""
     n, m = len(seq_a), len(seq_b)
     if n == 0 or m == 0:
         return float("inf")
-
     dtw = [[float("inf")] * (m + 1) for _ in range(n + 1)]
     dtw[0][0] = 0.0
-
     for i in range(1, n + 1):
         for j in range(1, m + 1):
-            cost = 0.0
-            for k in range(len(seq_a[i - 1])):
-                cost += (seq_a[i - 1][k] - seq_b[j - 1][k]) ** 2
-            cost = math.sqrt(cost)
-            dtw[i][j] = cost + min(dtw[i - 1][j], dtw[i][j - 1], dtw[i - 1][j - 1])
-
-    return dtw[n][m] / max(n, m)  # 正規化
+            cost = math.sqrt(sum(
+                (seq_a[i-1][k] - seq_b[j-1][k]) ** 2
+                for k in range(len(seq_a[i-1]))
+            ))
+            dtw[i][j] = cost + min(dtw[i-1][j], dtw[i][j-1], dtw[i-1][j-1])
+    return dtw[n][m] / max(n, m)
 
 
 def normalize_trajectory(traj):
-    """將軌跡正規化：置中 + 縮放到單位大小"""
     if len(traj) < 2:
         return traj
     arr = np.array(traj, dtype=np.float32)
-    center = arr.mean(axis=0)
-    arr -= center
+    arr -= arr.mean(axis=0)
     scale = np.abs(arr).max()
     if scale > 1e-6:
         arr /= scale
@@ -147,238 +119,191 @@ def normalize_trajectory(traj):
 
 
 class DTWMatcher:
-    """DTW 動態手勢比對器"""
-
     def __init__(self, gestures_dir, window_sec=2.0, threshold=1.5, cooldown=1.0):
+        self.gestures_dir = gestures_dir
         self.templates = {}
         self.window_sec = window_sec
         self.threshold = threshold
         self.cooldown = cooldown
         self.last_trigger_time = 0.0
-        # 滑動視窗：存放 (timestamp, {landmark_name: [x, y]})
         self.buffer = deque()
-        self.load_templates(gestures_dir)
+        self.reload()
 
-    def load_templates(self, gestures_dir):
-        if not os.path.isdir(gestures_dir):
+    def reload(self):
+        self.templates.clear()
+        if not os.path.isdir(self.gestures_dir):
             return
-        for fname in os.listdir(gestures_dir):
-            if fname.endswith(".json"):
-                path = os.path.join(gestures_dir, fname)
-                with open(path, "r") as f:
-                    data = json.load(f)
-                name = data.get("name", fname.replace(".json", ""))
-                # 取主要追蹤 landmark 的軌跡
-                landmark_key = data.get("track", "right_wrist")
-                raw = [[frame[landmark_key][0], frame[landmark_key][1]]
-                       for frame in data["frames"]
-                       if landmark_key in frame]
-                self.templates[name] = {
-                    "trajectory": normalize_trajectory(raw),
-                    "track": landmark_key,
-                }
+        for fname in os.listdir(self.gestures_dir):
+            if not fname.endswith(".json"):
+                continue
+            with open(os.path.join(self.gestures_dir, fname)) as f:
+                data = json.load(f)
+            name = data.get("name", fname.replace(".json", ""))
+            track = data.get("track", "right_wrist")
+            raw = [[fr[track][0], fr[track][1]]
+                   for fr in data["frames"] if track in fr]
+            self.templates[name] = {
+                "trajectory": normalize_trajectory(raw),
+                "track": track,
+            }
         if self.templates:
-            print(f"DTW: 載入 {len(self.templates)} 個手勢範本 ({', '.join(self.templates.keys())})")
+            print(f"DTW: 載入 {len(self.templates)} 個範本 ({', '.join(self.templates.keys())})")
+        else:
+            print("DTW: 尚無手勢範本（用 /cmd/record 或按 R 錄製）")
 
-    def push_frame(self, timestamp, landmarks_dict):
-        """推入一幀 landmark 資料"""
-        self.buffer.append((timestamp, landmarks_dict))
-        # 移除超出視窗的舊資料
+    def push_frame(self, timestamp, lm_dict):
+        self.buffer.append((timestamp, lm_dict))
         cutoff = timestamp - self.window_sec
         while self.buffer and self.buffer[0][0] < cutoff:
             self.buffer.popleft()
 
     def match(self):
-        """比對目前 buffer 中的軌跡，回傳 (gesture_name, score, is_trigger)"""
         now = time.time()
-        if len(self.buffer) < 10:
+        if len(self.buffer) < 10 or not self.templates:
             return "none", float("inf"), False
-
-        best_name = "none"
-        best_score = float("inf")
-
+        best_name, best_score = "none", float("inf")
         for name, tmpl in self.templates.items():
-            landmark_key = tmpl["track"]
-            # 從 buffer 抽取該 landmark 的軌跡
-            live_raw = []
-            for _, lm_dict in self.buffer:
-                if landmark_key in lm_dict:
-                    live_raw.append([lm_dict[landmark_key][0],
-                                     lm_dict[landmark_key][1]])
+            track = tmpl["track"]
+            live_raw = [[d[track][0], d[track][1]]
+                        for _, d in self.buffer if track in d]
             if len(live_raw) < 10:
                 continue
-
-            live_norm = normalize_trajectory(live_raw)
-            score = dtw_distance(live_norm, tmpl["trajectory"])
+            score = dtw_distance(normalize_trajectory(live_raw), tmpl["trajectory"])
             if score < best_score:
                 best_score = score
                 best_name = name
-
         is_trigger = (best_score < self.threshold
                       and (now - self.last_trigger_time) > self.cooldown)
         if is_trigger:
             self.last_trigger_time = now
-
         return best_name, best_score, is_trigger
 
 
-def record_gesture(cap, pose_det, name, duration, gestures_dir):
-    """錄製手勢範本"""
-    os.makedirs(gestures_dir, exist_ok=True)
+# ════════════════════════════════════════════════════
+#  即時錄製器（在主迴圈中運作，不需重啟）
+# ════════════════════════════════════════════════════
 
-    print(f"\n錄製手勢: {name}")
-    print(f"時間: {duration} 秒")
-    print("請準備好動作...")
-    print()
+class LiveRecorder:
+    """在即時追蹤中錄製手勢範本"""
 
-    # 倒數
-    for i in range(3, 0, -1):
-        print(f"  {i}...")
-        # 持續擷取畫面避免 buffer 堆積
-        start_wait = time.time()
-        while time.time() - start_wait < 1.0:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            h, w = frame.shape[:2]
-            cv2.putText(frame, f"Recording: {name}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            cv2.putText(frame, str(i), (w // 2 - 30, h // 2 + 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 3, (0, 0, 255), 4)
-            cv2.imshow("Azure Kinect - Record", frame)
-            cv2.waitKey(1)
+    def __init__(self, gestures_dir, default_duration=3.0):
+        self.gestures_dir = gestures_dir
+        self.default_duration = default_duration
+        self.auto_counter = 0
 
-    print("  >>> 開始錄製！<<<")
-    frames = []
-    start_time = time.time()
-    ts_base = int(time.time() * 1000)
+        # 狀態
+        self.state = "idle"  # idle / countdown / recording
+        self.name = ""
+        self.duration = 0.0
+        self.countdown_start = 0.0
+        self.record_start = 0.0
+        self.frames = []
 
-    while time.time() - start_time < duration:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        timestamp_ms = int(time.time() * 1000)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        result = pose_det.detect_for_video(mp_image, timestamp_ms)
-
-        if result.pose_landmarks:
-            lm_dict = {}
-            for idx, lm_name in DTW_TRACK_LANDMARKS.items():
-                lm = result.pose_landmarks[0][idx]
-                lm_dict[lm_name] = [lm.x, lm.y, lm.z]
-            frames.append(lm_dict)
-
-            # 畫出追蹤點
-            h, w = frame.shape[:2]
-            for idx in DTW_TRACK_LANDMARKS:
-                lm = result.pose_landmarks[0][idx]
-                cx, cy = int(lm.x * w), int(lm.y * h)
-                cv2.circle(frame, (cx, cy), 8, (0, 0, 255), -1)
-
-        elapsed = time.time() - start_time
-        progress = elapsed / duration
-        h, w = frame.shape[:2]
-        cv2.putText(frame, f"REC: {name} ({elapsed:.1f}s / {duration}s)",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        # 進度條
-        bar_w = int(w * 0.8)
-        bar_x = int(w * 0.1)
-        cv2.rectangle(frame, (bar_x, h - 40), (bar_x + bar_w, h - 20),
-                      (100, 100, 100), -1)
-        cv2.rectangle(frame, (bar_x, h - 40),
-                      (bar_x + int(bar_w * progress), h - 20),
-                      (0, 0, 255), -1)
-
-        cv2.imshow("Azure Kinect - Record", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            print("取消錄製")
+    def start(self, name=None, duration=None):
+        """開始錄製（先進入 3 秒倒數）"""
+        if self.state != "idle":
             return
+        if name is None:
+            self.auto_counter += 1
+            name = f"gesture_{self.auto_counter:03d}"
+        self.name = name
+        self.duration = duration or self.default_duration
+        self.state = "countdown"
+        self.countdown_start = time.time()
+        self.frames = []
+        print(f"錄製準備: {self.name} ({self.duration}s)")
 
-    cv2.destroyAllWindows()
+    def stop(self):
+        """提前停止錄製並儲存"""
+        if self.state == "recording":
+            self._save()
+        self.state = "idle"
 
-    if len(frames) < 10:
-        print(f"錯誤: 只錄到 {len(frames)} 幀，太少了")
-        return
+    def push_frame(self, lm_dict):
+        """每幀呼叫，回傳 (state, progress)"""
+        now = time.time()
 
-    # 儲存
-    data = {
-        "name": name,
-        "track": "right_wrist",  # 預設追蹤右手腕
-        "duration": duration,
-        "num_frames": len(frames),
-        "frames": frames,
-    }
-    path = os.path.join(gestures_dir, f"{name}.json")
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-    print(f"\n儲存完成: {path} ({len(frames)} 幀)")
-    print(f"追蹤關節: right_wrist")
-    print(f"提示: 若要改追蹤 left_wrist 或 nose，編輯 JSON 的 'track' 欄位")
+        if self.state == "countdown":
+            elapsed = now - self.countdown_start
+            if elapsed >= 3.0:
+                self.state = "recording"
+                self.record_start = now
+                self.frames = []
+                print(f">>> 開始錄製 {self.name}！")
+            return self.state, max(0, 3.0 - elapsed)
+
+        if self.state == "recording":
+            self.frames.append(lm_dict)
+            elapsed = now - self.record_start
+            progress = elapsed / self.duration
+            if elapsed >= self.duration:
+                self._save()
+                self.state = "idle"
+                return "saved", 1.0
+            return self.state, progress
+
+        return "idle", 0.0
+
+    def _save(self):
+        os.makedirs(self.gestures_dir, exist_ok=True)
+        if len(self.frames) < 10:
+            print(f"錄製失敗: 只有 {len(self.frames)} 幀")
+            return
+        data = {
+            "name": self.name,
+            "track": "right_wrist",
+            "duration": self.duration,
+            "num_frames": len(self.frames),
+            "frames": self.frames,
+        }
+        path = os.path.join(self.gestures_dir, f"{self.name}.json")
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"儲存: {path} ({len(self.frames)} 幀)")
 
 
 # ════════════════════════════════════════════════════
-#  規則姿態偵測
+#  規則姿態
 # ════════════════════════════════════════════════════
 
 class RuleDetector:
-    """基於規則的姿態偵測"""
-
     def __init__(self):
         self.prev_hip_y = None
         self.jump_cooldown = 0.0
 
     def detect(self, landmarks):
-        """回傳各規則的觸發狀態 dict"""
         lm = landmarks
-        results = {}
-
+        r = {}
         nose = lm[0]
-        l_shoulder, r_shoulder = lm[11], lm[12]
-        l_wrist, r_wrist = lm[15], lm[16]
-        l_hip, r_hip = lm[23], lm[24]
-        l_knee, r_knee = lm[25], lm[26]
+        l_sh, r_sh = lm[11], lm[12]
+        l_wr, r_wr = lm[15], lm[16]
+        l_hp, r_hp = lm[23], lm[24]
+        l_kn, r_kn = lm[25], lm[26]
 
-        mid_shoulder_y = (l_shoulder.y + r_shoulder.y) / 2
-        mid_hip_y = (l_hip.y + r_hip.y) / 2
-        mid_hip_x = (l_hip.x + r_hip.x) / 2
-        mid_shoulder_x = (l_shoulder.x + r_shoulder.x) / 2
+        mid_hp_y = (l_hp.y + r_hp.y) / 2
+        mid_hp_x = (l_hp.x + r_hp.x) / 2
+        mid_sh_x = (l_sh.x + r_sh.x) / 2
 
-        # 雙手舉過頭
-        results["arms_up"] = int(
-            l_wrist.y < nose.y and r_wrist.y < nose.y
-        )
-        # 單手
-        results["left_arm_up"] = int(l_wrist.y < l_shoulder.y - 0.1)
-        results["right_arm_up"] = int(r_wrist.y < r_shoulder.y - 0.1)
+        r["arms_up"] = int(l_wr.y < nose.y and r_wr.y < nose.y)
+        r["left_arm_up"] = int(l_wr.y < l_sh.y - 0.1)
+        r["right_arm_up"] = int(r_wr.y < r_sh.y - 0.1)
+        r["squat"] = int(((l_kn.y + r_kn.y) / 2) - mid_hp_y < 0.08)
 
-        # 蹲下：膝蓋 y 接近臀部 y
-        knee_hip_dist = ((l_knee.y + r_knee.y) / 2) - mid_hip_y
-        results["squat"] = int(knee_hip_dist < 0.08)
+        lean = mid_sh_x - mid_hp_x
+        r["lean_left"] = int(lean < -0.06)
+        r["lean_right"] = int(lean > 0.06)
 
-        # 身體傾斜：肩膀中心相對臀部中心的水平偏移
-        lean = mid_shoulder_x - mid_hip_x
-        results["lean_left"] = int(lean < -0.06)
-        results["lean_right"] = int(lean > 0.06)
+        hand_dist = math.sqrt((l_wr.x - r_wr.x)**2 + (l_wr.y - r_wr.y)**2)
+        r["hands_together"] = int(hand_dist < 0.08)
 
-        # 雙手靠近
-        hand_dist = math.sqrt(
-            (l_wrist.x - r_wrist.x) ** 2 + (l_wrist.y - r_wrist.y) ** 2
-        )
-        results["hands_together"] = int(hand_dist < 0.08)
-
-        # 跳躍偵測：臀部 y 突然下降（畫面座標 y 向下，跳起來 y 變小）
         now = time.time()
-        results["jump"] = 0
+        r["jump"] = 0
         if self.prev_hip_y is not None and now > self.jump_cooldown:
-            dy = self.prev_hip_y - mid_hip_y
-            if dy > 0.04:  # 臀部快速上升
-                results["jump"] = 1
+            if self.prev_hip_y - mid_hp_y > 0.04:
+                r["jump"] = 1
                 self.jump_cooldown = now + 0.8
-        self.prev_hip_y = mid_hip_y
-
-        return results
+        self.prev_hip_y = mid_hp_y
+        return r
 
 
 # ════════════════════════════════════════════════════
@@ -386,42 +311,43 @@ class RuleDetector:
 # ════════════════════════════════════════════════════
 
 def create_pose_landmarker():
-    options = mp.tasks.vision.PoseLandmarkerOptions(
-        base_options=BaseOptions(
-            model_asset_path=os.path.join(MODELS_DIR, "pose_landmarker_full.task")
-        ),
-        running_mode=VisionRunningMode.VIDEO,
-        num_poses=1,
-        min_pose_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
+    return mp.tasks.vision.PoseLandmarker.create_from_options(
+        mp.tasks.vision.PoseLandmarkerOptions(
+            base_options=BaseOptions(
+                model_asset_path=os.path.join(MODELS_DIR, "pose_landmarker_full.task")
+            ),
+            running_mode=VisionRunningMode.VIDEO,
+            num_poses=1,
+            min_pose_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
     )
-    return mp.tasks.vision.PoseLandmarker.create_from_options(options)
-
 
 def create_gesture_recognizer():
-    options = mp.tasks.vision.GestureRecognizerOptions(
-        base_options=BaseOptions(
-            model_asset_path=os.path.join(MODELS_DIR, "gesture_recognizer.task")
-        ),
-        running_mode=VisionRunningMode.VIDEO,
-        num_hands=2,
-        min_hand_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
+    return mp.tasks.vision.GestureRecognizer.create_from_options(
+        mp.tasks.vision.GestureRecognizerOptions(
+            base_options=BaseOptions(
+                model_asset_path=os.path.join(MODELS_DIR, "gesture_recognizer.task")
+            ),
+            running_mode=VisionRunningMode.VIDEO,
+            num_hands=2,
+            min_hand_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
     )
-    return mp.tasks.vision.GestureRecognizer.create_from_options(options)
-
 
 def create_face_landmarker():
-    options = mp.tasks.vision.FaceLandmarkerOptions(
-        base_options=BaseOptions(
-            model_asset_path=os.path.join(MODELS_DIR, "face_landmarker.task")
-        ),
-        running_mode=VisionRunningMode.VIDEO,
-        num_faces=1,
-        min_face_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
+    return mp.tasks.vision.FaceLandmarker.create_from_options(
+        mp.tasks.vision.FaceLandmarkerOptions(
+            base_options=BaseOptions(
+                model_asset_path=os.path.join(MODELS_DIR, "face_landmarker.task")
+            ),
+            running_mode=VisionRunningMode.VIDEO,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
     )
-    return mp.tasks.vision.FaceLandmarker.create_from_options(options)
 
 
 # ════════════════════════════════════════════════════
@@ -437,32 +363,22 @@ def send_pose_osc(client, result):
     else:
         client.send_message("/pose/detected", 0)
 
-
 def send_gesture_osc(client, result):
-    left_gesture = "None"
-    right_gesture = "None"
-    left_score = 0.0
-    right_score = 0.0
-
+    left_g, right_g = "None", "None"
+    left_s, right_s = 0.0, 0.0
     if result.gestures:
-        for i, (gesture_list, handedness_list) in enumerate(
-            zip(result.gestures, result.handedness)
-        ):
-            gesture_name = gesture_list[0].category_name if gesture_list else "None"
-            score = gesture_list[0].score if gesture_list else 0.0
-            hand_label = handedness_list[0].category_name if handedness_list else ""
-            if hand_label == "Left":
-                right_gesture = gesture_name
-                right_score = score
-            elif hand_label == "Right":
-                left_gesture = gesture_name
-                left_score = score
-
-    client.send_message("/gesture/left", left_gesture)
-    client.send_message("/gesture/right", right_gesture)
-    client.send_message("/gesture/left/score", left_score)
-    client.send_message("/gesture/right/score", right_score)
-
+        for gl, hl in zip(result.gestures, result.handedness):
+            gn = gl[0].category_name if gl else "None"
+            gs = gl[0].score if gl else 0.0
+            hand = hl[0].category_name if hl else ""
+            if hand == "Left":
+                right_g, right_s = gn, gs
+            elif hand == "Right":
+                left_g, left_s = gn, gs
+    client.send_message("/gesture/left", left_g)
+    client.send_message("/gesture/right", right_g)
+    client.send_message("/gesture/left/score", left_s)
+    client.send_message("/gesture/right/score", right_s)
 
 def send_face_osc(client, result):
     if result.face_landmarks:
@@ -482,60 +398,41 @@ def draw_pose(frame, result):
     if not result.pose_landmarks:
         return
     h, w = frame.shape[:2]
-    landmarks = result.pose_landmarks[0]
-    connections = [
-        (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
-        (11, 23), (12, 24), (23, 24),
-        (23, 25), (25, 27), (24, 26), (26, 28),
-        (15, 17), (15, 19), (16, 18), (16, 20),
-    ]
-    for a, b in connections:
-        x1, y1 = int(landmarks[a].x * w), int(landmarks[a].y * h)
-        x2, y2 = int(landmarks[b].x * w), int(landmarks[b].y * h)
-        cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    lms = result.pose_landmarks[0]
+    for a, b in [(11,12),(11,13),(13,15),(12,14),(14,16),(11,23),(12,24),
+                 (23,24),(23,25),(25,27),(24,26),(26,28),(15,17),(15,19),(16,18),(16,20)]:
+        cv2.line(frame,
+                 (int(lms[a].x*w), int(lms[a].y*h)),
+                 (int(lms[b].x*w), int(lms[b].y*h)), (0,255,0), 2)
     for idx, name in POSE_LANDMARK_NAMES.items():
-        lm = landmarks[idx]
-        cx, cy = int(lm.x * w), int(lm.y * h)
-        cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1)
-        cv2.putText(frame, name.split("_")[-1], (cx + 8, cy - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-
+        lm = lms[idx]
+        cx, cy = int(lm.x*w), int(lm.y*h)
+        cv2.circle(frame, (cx, cy), 5, (0,0,255), -1)
+        cv2.putText(frame, name.split("_")[-1], (cx+8, cy-5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255,255,255), 1)
 
 def draw_gesture(frame, result):
     if not result.gestures:
         return
     h, w = frame.shape[:2]
     for hand_lms in (result.hand_landmarks or []):
-        connections = [
-            (0, 1), (1, 2), (2, 3), (3, 4),
-            (0, 5), (5, 6), (6, 7), (7, 8),
-            (0, 9), (9, 10), (10, 11), (11, 12),
-            (0, 13), (13, 14), (14, 15), (15, 16),
-            (0, 17), (17, 18), (18, 19), (19, 20),
-            (5, 9), (9, 13), (13, 17),
-        ]
-        for a, b in connections:
-            x1, y1 = int(hand_lms[a].x * w), int(hand_lms[a].y * h)
-            x2, y2 = int(hand_lms[b].x * w), int(hand_lms[b].y * h)
-            cv2.line(frame, (x1, y1), (x2, y2), (255, 100, 0), 2)
-        for lm in hand_lms:
-            cx, cy = int(lm.x * w), int(lm.y * h)
-            cv2.circle(frame, (cx, cy), 3, (255, 100, 0), -1)
-    for i, (gesture_list, handedness_list) in enumerate(
-        zip(result.gestures, result.handedness)
-    ):
-        gesture_name = gesture_list[0].category_name if gesture_list else "?"
-        score = gesture_list[0].score if gesture_list else 0
-        hand_label = handedness_list[0].category_name if handedness_list else "?"
+        for a, b in [(0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
+                     (0,9),(9,10),(10,11),(11,12),(0,13),(13,14),(14,15),(15,16),
+                     (0,17),(17,18),(18,19),(19,20),(5,9),(9,13),(13,17)]:
+            cv2.line(frame,
+                     (int(hand_lms[a].x*w), int(hand_lms[a].y*h)),
+                     (int(hand_lms[b].x*w), int(hand_lms[b].y*h)), (255,100,0), 2)
+    for i, (gl, hl) in enumerate(zip(result.gestures, result.handedness)):
+        gn = gl[0].category_name if gl else "?"
+        gs = gl[0].score if gl else 0
+        hand = hl[0].category_name if hl else "?"
         if result.hand_landmarks and i < len(result.hand_landmarks):
-            wrist = result.hand_landmarks[i][0]
-            tx, ty = int(wrist.x * w), int(wrist.y * h) - 20
+            wr = result.hand_landmarks[i][0]
+            tx, ty = int(wr.x*w), int(wr.y*h) - 20
         else:
-            tx, ty = 10, 80 + i * 40
-        text = f"{hand_label}: {gesture_name} ({score:.0%})"
-        cv2.putText(frame, text, (tx, ty),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
+            tx, ty = 10, 80 + i*40
+        cv2.putText(frame, f"{hand}: {gn} ({gs:.0%})", (tx, ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
 
 def draw_face(frame, result):
     if not result.face_landmarks:
@@ -543,35 +440,49 @@ def draw_face(frame, result):
     h, w = frame.shape[:2]
     for idx, name in FACE_LANDMARK_NAMES.items():
         lm = result.face_landmarks[0][idx]
-        cx, cy = int(lm.x * w), int(lm.y * h)
-        cv2.circle(frame, (cx, cy), 4, (255, 200, 0), -1)
-        cv2.putText(frame, name, (cx + 6, cy - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 200, 0), 1)
+        cx, cy = int(lm.x*w), int(lm.y*h)
+        cv2.circle(frame, (cx, cy), 4, (255,200,0), -1)
+        cv2.putText(frame, name, (cx+6, cy-5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255,200,0), 1)
 
-
-def draw_rules(frame, rules_state, y_offset=60):
-    """在畫面上顯示規則偵測狀態"""
-    y = y_offset
-    for name, active in rules_state.items():
-        color = (0, 255, 0) if active else (80, 80, 80)
-        label = f"{'>>>' if active else '   '} {name}"
-        cv2.putText(frame, label, (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+def draw_rules(frame, rules, y_start=60):
+    y = y_start
+    for name, active in rules.items():
+        color = (0,255,0) if active else (80,80,80)
+        cv2.putText(frame, f"{'>>>' if active else '   '} {name}",
+                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
         y += 22
 
-
-def draw_dtw(frame, dtw_name, dtw_score, is_trigger, y_offset=60):
-    """在畫面右上角顯示 DTW 結果"""
+def draw_dtw(frame, name, score, trigger):
     h, w = frame.shape[:2]
-    if is_trigger:
-        color = (0, 255, 255)
-        cv2.putText(frame, f"DTW: {dtw_name}", (w - 300, y_offset),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
-    elif dtw_name != "none":
-        color = (150, 150, 150)
-        cv2.putText(frame, f"dtw: {dtw_name} ({dtw_score:.2f})",
-                    (w - 300, y_offset),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+    if trigger:
+        cv2.putText(frame, f"DTW: {name}", (w-300, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,255), 3)
+    elif name != "none":
+        cv2.putText(frame, f"dtw: {name} ({score:.2f})", (w-300, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
+
+def draw_recording(frame, rec_state, rec_value, rec_name):
+    h, w = frame.shape[:2]
+    if rec_state == "countdown":
+        sec = int(rec_value) + 1
+        cv2.putText(frame, f"REC {rec_name} in {sec}",
+                    (w//2-150, h//2), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
+    elif rec_state == "recording":
+        # 紅色閃爍圓點
+        if int(time.time() * 3) % 2:
+            cv2.circle(frame, (w-30, 30), 12, (0,0,255), -1)
+        cv2.putText(frame, f"REC: {rec_name}", (w-250, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+        # 進度條
+        bar_w = int(w * 0.3)
+        bar_x = w - bar_w - 20
+        cv2.rectangle(frame, (bar_x, 70), (bar_x + bar_w, 85), (100,100,100), -1)
+        cv2.rectangle(frame, (bar_x, 70),
+                      (bar_x + int(bar_w * rec_value), 85), (0,0,255), -1)
+    elif rec_state == "saved":
+        cv2.putText(frame, f"Saved: {rec_name}", (w-300, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
 
 
 # ════════════════════════════════════════════════════
@@ -584,29 +495,21 @@ def main():
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--osc-ip", default="127.0.0.1")
-    parser.add_argument("--osc-port", type=int, default=9000)
-
-    # 追蹤模式
-    parser.add_argument("--pose", action="store_true", help="骨架關節追蹤")
-    parser.add_argument("--gesture", action="store_true", help="靜態手勢辨識")
-    parser.add_argument("--face", action="store_true", help="臉部追蹤")
-    parser.add_argument("--dtw", action="store_true", help="DTW 動態手勢辨識")
-    parser.add_argument("--rules", action="store_true", help="規則姿態偵測")
-    parser.add_argument("--all", action="store_true", help="全部開啟")
-
-    # DTW 參數
-    parser.add_argument("--dtw-threshold", type=float, default=1.5,
-                        help="DTW 觸發閾值（越小越嚴格，預設 1.5）")
-    parser.add_argument("--dtw-window", type=float, default=2.0,
-                        help="DTW 滑動視窗秒數（預設 2.0）")
-
-    # 錄製模式
-    parser.add_argument("--record", metavar="NAME", help="錄製手勢範本")
-    parser.add_argument("--duration", type=float, default=3.0,
-                        help="錄製秒數（預設 3.0）")
-    parser.add_argument("--list-gestures", action="store_true",
-                        help="列出已錄製的手勢")
-
+    parser.add_argument("--osc-port", type=int, default=9000,
+                        help="OSC 送出 port（預設 9000）")
+    parser.add_argument("--listen-port", type=int, default=9001,
+                        help="OSC 接收 port（預設 9001）")
+    parser.add_argument("--pose", action="store_true")
+    parser.add_argument("--gesture", action="store_true")
+    parser.add_argument("--face", action="store_true")
+    parser.add_argument("--dtw", action="store_true")
+    parser.add_argument("--rules", action="store_true")
+    parser.add_argument("--all", action="store_true")
+    parser.add_argument("--dtw-threshold", type=float, default=1.5)
+    parser.add_argument("--dtw-window", type=float, default=2.0)
+    parser.add_argument("--record-duration", type=float, default=3.0,
+                        help="預設錄製秒數（預設 3.0）")
+    parser.add_argument("--list-gestures", action="store_true")
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
 
@@ -615,30 +518,26 @@ def main():
         if not os.path.isdir(GESTURES_DIR):
             print("尚無錄製的手勢")
             return
-        for fname in sorted(os.listdir(GESTURES_DIR)):
-            if fname.endswith(".json"):
-                path = os.path.join(GESTURES_DIR, fname)
-                with open(path) as f:
-                    data = json.load(f)
-                print(f"  {data['name']:15s}  {data['num_frames']:3d} 幀  "
-                      f"{data['duration']:.1f}s  追蹤: {data['track']}")
+        for fn in sorted(os.listdir(GESTURES_DIR)):
+            if fn.endswith(".json"):
+                with open(os.path.join(GESTURES_DIR, fn)) as f:
+                    d = json.load(f)
+                print(f"  {d['name']:15s}  {d['num_frames']:3d} 幀  "
+                      f"{d['duration']:.1f}s  追蹤: {d['track']}")
         return
 
-    # 預設模式
+    # 模式設定
     if args.all:
         args.pose = args.gesture = args.face = args.dtw = args.rules = True
-    if args.record:
-        args.pose = True
     if args.dtw or args.rules:
         args.pose = True
     if not args.pose and not args.gesture and not args.face:
         args.pose = True
         args.gesture = True
 
-    # 尋找攝影機
+    # 攝影機
     cam_index = args.camera
     if cam_index is None:
-        print("正在尋找攝影機...")
         for i in range(5):
             cap = cv2.VideoCapture(i)
             if cap.isOpened():
@@ -657,21 +556,11 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"攝影機 [{cam_index}] {actual_w}×{actual_h}")
 
-    # 錄製模式
-    if args.record:
-        pose_det = create_pose_landmarker()
-        record_gesture(cap, pose_det, args.record, args.duration, GESTURES_DIR)
-        pose_det.close()
-        cap.release()
-        return
-
-    # OSC
+    # OSC 送出
     osc = udp_client.SimpleUDPClient(args.osc_ip, args.osc_port)
-    print(f"OSC → {args.osc_ip}:{args.osc_port}")
 
-    # 建立偵測器
+    # 偵測器
     pose_det = create_pose_landmarker() if args.pose else None
     gesture_det = create_gesture_recognizer() if args.gesture else None
     face_det = create_face_landmarker() if args.face else None
@@ -679,25 +568,55 @@ def main():
         GESTURES_DIR, args.dtw_window, args.dtw_threshold
     ) if args.dtw else None
     rule_det = RuleDetector() if args.rules else None
+    recorder = LiveRecorder(GESTURES_DIR, args.record_duration)
 
+    # ── OSC 接收（背景執行緒）──
+    def on_cmd_record(addr, *osc_args):
+        name = str(osc_args[0]) if osc_args else None
+        dur = float(osc_args[1]) if len(osc_args) > 1 else None
+        recorder.start(name, dur)
+
+    def on_cmd_record_stop(addr, *osc_args):
+        recorder.stop()
+
+    def on_cmd_reload(addr, *osc_args):
+        if dtw_matcher:
+            dtw_matcher.reload()
+            osc.send_message("/rec/status", "reloaded")
+
+    def on_cmd_threshold(addr, *osc_args):
+        if dtw_matcher and osc_args:
+            dtw_matcher.threshold = float(osc_args[0])
+            print(f"DTW threshold → {dtw_matcher.threshold}")
+
+    disp = Dispatcher()
+    disp.map("/cmd/record/stop", on_cmd_record_stop)
+    disp.map("/cmd/record", on_cmd_record)
+    disp.map("/cmd/reload", on_cmd_reload)
+    disp.map("/cmd/threshold", on_cmd_threshold)
+
+    osc_server = ThreadingOSCUDPServer(("0.0.0.0", args.listen_port), disp)
+    server_thread = threading.Thread(target=osc_server.serve_forever, daemon=True)
+    server_thread.start()
+
+    # ── 輸出資訊 ──
     features = []
-    if pose_det:
-        features.append("姿態")
-    if gesture_det:
-        features.append("靜態手勢")
-    if dtw_matcher:
-        features.append("DTW動態手勢")
-    if rule_det:
-        features.append("規則偵測")
-    if face_det:
-        features.append("臉部")
+    if pose_det:    features.append("姿態")
+    if gesture_det: features.append("靜態手勢")
+    if dtw_matcher: features.append("DTW")
+    if rule_det:    features.append("規則")
+    if face_det:    features.append("臉部")
 
+    print(f"攝影機 [{cam_index}] {actual_w}×{actual_h}")
+    print(f"OSC 送出 → {args.osc_ip}:{args.osc_port}")
+    print(f"OSC 接收 ← 0.0.0.0:{args.listen_port}")
     print(f"模式: {' + '.join(features)}")
-    print("按 Q 結束\n")
+    print(f"鍵盤: R=錄製  1-5=快速錄製  Q=結束\n")
 
     fps_count = 0
     fps = 0.0
     fps_time = time.time()
+    saved_flash_until = 0.0
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -709,6 +628,7 @@ def main():
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
+        # ── 姿態 ──
         pose_result = None
         if pose_det:
             pose_result = pose_det.detect_for_video(mp_image, timestamp_ms)
@@ -716,8 +636,27 @@ def main():
             if not args.no_preview:
                 draw_pose(frame, pose_result)
 
-        # DTW
-        if dtw_matcher and pose_result and pose_result.pose_landmarks:
+        # ── 錄製（需要 pose 資料）──
+        rec_state, rec_value = "idle", 0.0
+        if pose_result and pose_result.pose_landmarks and recorder.state != "idle":
+            lm_dict = {}
+            for idx, lm_name in DTW_TRACK_LANDMARKS.items():
+                lm = pose_result.pose_landmarks[0][idx]
+                lm_dict[lm_name] = [lm.x, lm.y, lm.z]
+            rec_state, rec_value = recorder.push_frame(lm_dict)
+            osc.send_message("/rec/status", rec_state)
+            osc.send_message("/rec/progress", rec_value if isinstance(rec_value, float) else 0.0)
+            if rec_state == "saved":
+                saved_flash_until = time.time() + 2.0
+                # 自動重新載入 DTW 範本
+                if dtw_matcher:
+                    dtw_matcher.reload()
+        elif recorder.state == "countdown":
+            rec_state, rec_value = recorder.push_frame({})
+            osc.send_message("/rec/status", rec_state)
+
+        # ── DTW ──
+        if dtw_matcher and pose_result and pose_result.pose_landmarks and recorder.state == "idle":
             lm_dict = {}
             for idx, lm_name in DTW_TRACK_LANDMARKS.items():
                 lm = pose_result.pose_landmarks[0][idx]
@@ -730,26 +669,29 @@ def main():
             if not args.no_preview:
                 draw_dtw(frame, dtw_name, dtw_score, is_trigger)
 
-        # Rules
+        # ── 規則 ──
         if rule_det and pose_result and pose_result.pose_landmarks:
-            rules_state = rule_det.detect(pose_result.pose_landmarks[0])
-            for name, val in rules_state.items():
+            rules = rule_det.detect(pose_result.pose_landmarks[0])
+            for name, val in rules.items():
                 osc.send_message(f"/rule/{name}", val)
             if not args.no_preview:
-                draw_rules(frame, rules_state)
+                draw_rules(frame, rules)
 
+        # ── 靜態手勢 ──
         if gesture_det:
             gesture_result = gesture_det.recognize_for_video(mp_image, timestamp_ms)
             send_gesture_osc(osc, gesture_result)
             if not args.no_preview:
                 draw_gesture(frame, gesture_result)
 
+        # ── 臉部 ──
         if face_det:
             face_result = face_det.detect_for_video(mp_image, timestamp_ms)
             send_face_osc(osc, face_result)
             if not args.no_preview:
                 draw_face(frame, face_result)
 
+        # ── FPS ──
         now = time.time()
         if now - fps_time >= 1.0:
             fps = fps_count / (now - fps_time)
@@ -757,14 +699,34 @@ def main():
             fps_time = now
             osc.send_message("/fps", fps)
 
+        # ── 預覽 ──
         if not args.no_preview:
             cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.imshow("Azure Kinect - MediaPipe", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
 
+            # 錄製 UI
+            if recorder.state != "idle":
+                draw_recording(frame, rec_state, rec_value, recorder.name)
+            elif now < saved_flash_until:
+                draw_recording(frame, "saved", 1.0, recorder.name)
+
+            cv2.imshow("Azure Kinect - MediaPipe", frame)
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord("q"):
+                break
+            elif key == ord("r"):
+                if recorder.state == "idle":
+                    recorder.start()
+                else:
+                    recorder.stop()
+            elif key in [ord("1"), ord("2"), ord("3"), ord("4"), ord("5")]:
+                n = chr(key)
+                recorder.start(f"gesture_{n}")
+
+    # 清理
     cap.release()
+    osc_server.shutdown()
     if not args.no_preview:
         cv2.destroyAllWindows()
     for d in [pose_det, gesture_det, face_det]:
