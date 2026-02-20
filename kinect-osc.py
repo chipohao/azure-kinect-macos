@@ -157,10 +157,43 @@ class DTWMatcher:
         while self.buffer and self.buffer[0][0] < cutoff:
             self.buffer.popleft()
 
+    def _compute_progress(self, live_norm, tmpl_traj):
+        """計算手勢進行百分比：比對到範本的第幾段"""
+        if len(live_norm) < 3 or len(tmpl_traj) < 3:
+            return 0.0
+        # 將範本切成 10 段，找到 live 最接近的段落
+        n_segments = 10
+        seg_len = max(1, len(tmpl_traj) // n_segments)
+        best_seg = 0
+        best_seg_score = float("inf")
+        # 用 live 的後半段（最近的動作）和範本的各段比對
+        live_tail = live_norm[-(len(live_norm) // 2):]
+        if len(live_tail) < 3:
+            live_tail = live_norm
+        for seg_i in range(n_segments):
+            start = seg_i * seg_len
+            end = min(start + seg_len + len(live_tail), len(tmpl_traj))
+            seg = tmpl_traj[start:end]
+            if len(seg) < 3:
+                continue
+            score = dtw_distance(live_tail, seg)
+            if score < best_seg_score:
+                best_seg_score = score
+                best_seg = seg_i
+        return (best_seg + 1) / n_segments
+
     def match(self):
+        """回傳 (best_name, best_score, is_trigger, per_gesture_info)
+        per_gesture_info = {name: {"score": f, "progress": f, "following": bool}}
+        """
         now = time.time()
+        info = {}
+        for name in self.templates:
+            info[name] = {"score": float("inf"), "progress": 0.0, "following": False}
+
         if len(self.buffer) < 10 or not self.templates:
-            return "none", float("inf"), False
+            return "none", float("inf"), False, info
+
         best_name, best_score = "none", float("inf")
         for name, tmpl in self.templates.items():
             track = tmpl["track"]
@@ -168,15 +201,20 @@ class DTWMatcher:
                         for _, d in self.buffer if track in d]
             if len(live_raw) < 10:
                 continue
-            score = dtw_distance(normalize_trajectory(live_raw), tmpl["trajectory"])
+            live_norm = normalize_trajectory(live_raw)
+            score = dtw_distance(live_norm, tmpl["trajectory"])
+            progress = self._compute_progress(live_norm, tmpl["trajectory"])
+            following = score < self.threshold * 1.5  # 寬鬆一點判斷是否在跟蹤
+            info[name] = {"score": score, "progress": progress, "following": following}
             if score < best_score:
                 best_score = score
                 best_name = name
+
         is_trigger = (best_score < self.threshold
                       and (now - self.last_trigger_time) > self.cooldown)
         if is_trigger:
             self.last_trigger_time = now
-        return best_name, best_score, is_trigger
+        return best_name, best_score, is_trigger, info
 
 
 # ════════════════════════════════════════════════════
@@ -662,15 +700,16 @@ def main():
                 lm = pose_result.pose_landmarks[0][idx]
                 lm_dict[lm_name] = [lm.x, lm.y]
             dtw_matcher.push_frame(time.time(), lm_dict)
-            dtw_name, dtw_score, is_trigger = dtw_matcher.match()
-            # 每個手勢獨立的 trigger path
-            # /dtw/wave 1, /dtw/circle 0, ...
-            for gname in dtw_matcher.templates:
+            dtw_name, dtw_score, is_trigger, dtw_info = dtw_matcher.match()
+            # 每個手勢獨立的 trigger + progress + following
+            for gname, ginfo in dtw_info.items():
                 if is_trigger and gname == dtw_name:
                     osc.send_message(f"/dtw/{gname}", 1)
                 else:
                     osc.send_message(f"/dtw/{gname}", 0)
-            # 同時也送通用的
+                osc.send_message(f"/dtw/{gname}/progress", ginfo["progress"])
+                osc.send_message(f"/dtw/{gname}/following", int(ginfo["following"]))
+            # 通用
             osc.send_message("/dtw/gesture", dtw_name)
             osc.send_message("/dtw/score", dtw_score)
             if not args.no_preview:
