@@ -3,7 +3,7 @@
 Azure Kinect DK → MediaPipe → OSC (雙向)
 
 用法:
-    source ~/azure-kinect-osc/bin/activate
+    ./run.sh                                    # 自動建環境 + 啟動
     python kinect-osc.py                        # 預設：姿態 + 手勢
     python kinect-osc.py --pose --dtw --rules   # 骨架 + DTW + 規則
     python kinect-osc.py --all                  # 全部功能

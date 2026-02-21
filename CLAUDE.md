@@ -18,7 +18,7 @@ Azure Kinect RGB (UVC) → OpenCV → MediaPipe → OSC (port 9000) → Max/MSP 
 
 ## Dependencies
 
-Python venv: `~/azure-kinect-osc/` (Python 3.12)
+Python venv: `.venv/` (Python 3.12, 由 `run.sh` 自動建立)
 
 ```
 opencv-contrib-python   # 攝影機擷取（不要同時裝 opencv-python，會衝突）
@@ -38,10 +38,9 @@ numpy                   # 數值計算
 ## Running
 
 ```bash
-source ~/azure-kinect-osc/bin/activate
-python kinect-osc.py --pose --dtw --rules    # 常用組合
-python kinect-osc.py --all                   # 全功能
-python kinect-osc.py --no-preview            # headless 模式
+./run.sh                        # 自動建環境 + 啟動（預設 --pose --dtw --rules）
+./run.sh --all                  # 全功能
+./run.sh --no-preview           # headless 模式
 ```
 
 ## Hardware Limitations

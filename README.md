@@ -34,27 +34,27 @@ Azure Kinect DK 的深度攝影機在 macOS 上無法使用（Microsoft 閉源�
 
 ---
 
-## 安裝
+## 安裝與啟動
 
 ```bash
-# 建立 Python 虛擬環境（已建在 ~/azure-kinect-osc/）
-/opt/homebrew/bin/python3.12 -m venv ~/azure-kinect-osc
-source ~/azure-kinect-osc/bin/activate
-pip install mediapipe opencv-contrib-python python-osc
+git clone https://github.com/chipohao/azure-kinect-macos.git
+cd azure-kinect-macos
+./run.sh
 ```
 
-MediaPipe 模型檔已下載在 `models/` 目錄。
+`run.sh` 會自動：
+1. 建立 `.venv/` Python 虛擬環境（需要 Python 3.10+）
+2. 安裝所有依賴（`requirements.txt`）
+3. 下載 MediaPipe 模型到 `models/`
+4. 啟動程式（預設 `--pose --dtw --rules`）
 
----
+每台電腦第一次跑會花約 1 分鐘安裝，之後直接啟動。
 
-## 快速開始
-
+**指定其他模式：**
 ```bash
-source ~/azure-kinect-osc/bin/activate
-cd ~/Library/Mobile\ Documents/com~apple~CloudDocs/AntigravityProjects/azure-kinect-dk
-
-# 啟動（骨架 + DTW 手勢 + 規則姿態）
-python kinect-osc.py --pose --dtw --rules
+./run.sh --all                  # 全功能
+./run.sh --gesture              # 只有靜態手勢
+./run.sh --no-preview           # 不開預覽視窗
 ```
 
 啟動後：
@@ -375,20 +375,17 @@ python kinect-osc.py --list-gestures    # 列出已錄的
 ## 檔案結構
 
 ```
-azure-kinect-dk/
+azure-kinect-macos/
+├── run.sh                      ← 一鍵啟動（自動建環境）
 ├── kinect-osc.py               ← 主程式
+├── requirements.txt            ← Python 依賴
 ├── README.md                   ← 本文件
-├── models/                     ← MediaPipe 模型（.gitignore）
-│   ├── pose_landmarker_full.task
-│   ├── hand_landmarker.task
-│   ├── face_landmarker.task
-│   └── gesture_recognizer.task
+├── MANUAL.md                   ← 使用者手冊
+├── .venv/                      ← Python 虛擬環境（自動建立，gitignored）
+├── models/                     ← MediaPipe 模型（自動下載，gitignored）
 ├── gestures/                   ← DTW 手勢範本（錄製後自動建立）
 │   └── *.json
-├── max-patches/
-│   ├── azure-kinect-rgb.maxpat ← RGB 直接擷取
-│   └── azure-kinect-mic.maxpat ← 7ch 麥克風
-└── td-projects/
+└── max-patches/
+    ├── azure-kinect-rgb.maxpat ← RGB 直接擷取
+    └── azure-kinect-mic.maxpat ← 7ch 麥克風
 ```
-
-Python 虛擬環境：`~/azure-kinect-osc/` (Python 3.12)

@@ -7,10 +7,11 @@
 ## 啟動
 
 ```bash
-source ~/azure-kinect-osc/bin/activate
-cd ~/Library/Mobile\ Documents/com~apple~CloudDocs/AntigravityProjects/azure-kinect-dk
-python kinect-osc.py --pose --dtw --rules
+cd azure-kinect-macos
+./run.sh                        # 自動安裝依賴 + 啟動
 ```
+
+首次執行會自動建立環境和下載模型（約 1 分鐘），之後直接啟動。
 
 啟動後會出現預覽視窗，按 **Q** 關閉。
 
