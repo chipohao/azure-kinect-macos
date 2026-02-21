@@ -43,12 +43,12 @@ cd azure-kinect-macos
 ```
 
 `run.sh` 會自動：
-1. 建立 `.venv/` Python 虛擬環境（需要 Python 3.10+）
-2. 安裝所有依賴（`requirements.txt`）
-3. 下載 MediaPipe 模型到 `models/`
-4. 啟動程式（預設 `--pose --dtw --rules`）
+1. 下載 MediaPipe 模型到 `models/`
+2. 透過 `uv` 建立 `.venv/` 並安裝依賴（定義在 `pyproject.toml`）
+3. 啟動程式（預設 `--pose --dtw --rules`）
 
-每台電腦第一次跑會花約 1 分鐘安裝，之後直接啟動。
+前提：需要安裝 [uv](https://docs.astral.sh/uv/)（`curl -LsSf https://astral.sh/uv/install.sh | sh`）。
+每台電腦第一次跑會花約 1 分鐘安裝依賴，之後直接啟動。
 
 **指定其他模式：**
 ```bash
@@ -376,12 +376,12 @@ python kinect-osc.py --list-gestures    # 列出已錄的
 
 ```
 azure-kinect-macos/
-├── run.sh                      ← 一鍵啟動（自動建環境）
+├── run.sh                      ← 一鍵啟動（下載模型 + uv run）
 ├── kinect-osc.py               ← 主程式
-├── requirements.txt            ← Python 依賴
+├── pyproject.toml              ← Python 依賴定義
 ├── README.md                   ← 本文件
 ├── MANUAL.md                   ← 使用者手冊
-├── .venv/                      ← Python 虛擬環境（自動建立，gitignored）
+├── .venv/                      ← Python 虛擬環境（uv 自動建立，gitignored）
 ├── models/                     ← MediaPipe 模型（自動下載，gitignored）
 ├── gestures/                   ← DTW 手勢範本（錄製後自動建立）
 │   └── *.json

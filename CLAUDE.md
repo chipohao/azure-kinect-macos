@@ -18,7 +18,7 @@ Azure Kinect RGB (UVC) → OpenCV → MediaPipe → OSC (port 9000) → Max/MSP 
 
 ## Dependencies
 
-Python venv: `.venv/` (Python 3.12, 由 `run.sh` 自動建立)
+依賴定義在 `pyproject.toml`，由 `uv` 管理（自動建 `.venv/`）。
 
 ```
 opencv-contrib-python   # 攝影機擷取（不要同時裝 opencv-python，會衝突）

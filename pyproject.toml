@@ -1,0 +1,14 @@
+[project]
+name = "azure-kinect-macos"
+version = "1.0.0"
+description = "Azure Kinect DK → MediaPipe → OSC on macOS"
+requires-python = ">=3.10"
+dependencies = [
+    "mediapipe>=0.10",
+    "opencv-contrib-python>=4.8",
+    "python-osc>=1.8",
+    "numpy>=1.24",
+]
+
+[project.scripts]
+kinect-osc = "kinect_osc:main"
