@@ -13,8 +13,11 @@ OSC 送出 (→ Max/TD，預設 port 9000):
     /pose/{joint}           x y z       17 個關節
     /gesture/left           string      靜態手勢名
     /gesture/right          string
-    /dtw/gesture            string      動態手勢名
-    /dtw/trigger            0 或 1      觸發瞬間
+    /dtw/{name}             0 或 1      該手勢是否觸發
+    /dtw/{name}/progress    0.0~1.0     手勢進行百分比
+    /dtw/{name}/following   0 或 1      是否正在跟蹤
+    /dtw/gesture            string      目前最接近的手勢名
+    /dtw/score              float       DTW 距離
     /rule/{name}            0 或 1      規則姿態
     /face/{point}           x y z       6 個臉部點
     /rec/status             string      錄製狀態 (idle/countdown/recording/saved)
@@ -27,6 +30,10 @@ OSC 接收 (← Max/TD，預設 port 9001):
     /cmd/record/stop                    提前停止錄製
     /cmd/reload                         重新載入手勢範本
     /cmd/threshold <float>              調整 DTW 閾值
+    /cmd/mode/<mode> <0|1>              切換模式 (pose/gesture/face/dtw/rules)
+    /cmd/delete <name>                  刪除手勢範本
+    /cmd/list                           回傳已載入的手勢列表
+    /cmd/stop                           優雅關閉程式
 
 鍵盤快捷鍵（預覽視窗 focus 時）:
     R       開始/停止錄製（名稱自動編號 gesture_001, 002...）
@@ -91,20 +98,24 @@ FACE_LANDMARK_NAMES = {
 #  DTW
 # ════════════════════════════════════════════════════
 
-def dtw_distance(seq_a, seq_b):
-    n, m = len(seq_a), len(seq_b)
+def dtw_distance(seq_a, seq_b, band_ratio=0.3):
+    """DTW 距離計算（numpy 向量化 + Sakoe-Chiba band 加速）"""
+    a = np.array(seq_a, dtype=np.float32)
+    b = np.array(seq_b, dtype=np.float32)
+    n, m = len(a), len(b)
     if n == 0 or m == 0:
         return float("inf")
-    dtw = [[float("inf")] * (m + 1) for _ in range(n + 1)]
-    dtw[0][0] = 0.0
+    # 預計算所有成對距離的子集（band 內）
+    band = max(3, int(max(n, m) * band_ratio))
+    dtw = np.full((n + 1, m + 1), np.inf, dtype=np.float32)
+    dtw[0, 0] = 0.0
     for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            cost = math.sqrt(sum(
-                (seq_a[i-1][k] - seq_b[j-1][k]) ** 2
-                for k in range(len(seq_a[i-1]))
-            ))
-            dtw[i][j] = cost + min(dtw[i-1][j], dtw[i][j-1], dtw[i-1][j-1])
-    return dtw[n][m] / max(n, m)
+        j_start = max(1, i * m // n - band)
+        j_end = min(m, i * m // n + band) + 1
+        for j in range(j_start, j_end):
+            cost = np.sqrt(np.sum((a[i-1] - b[j-1]) ** 2))
+            dtw[i, j] = cost + min(dtw[i-1, j], dtw[i, j-1], dtw[i-1, j-1])
+    return float(dtw[n, m]) / max(n, m)
 
 
 def normalize_trajectory(traj):
@@ -119,7 +130,8 @@ def normalize_trajectory(traj):
 
 
 class DTWMatcher:
-    def __init__(self, gestures_dir, window_sec=2.0, threshold=1.5, cooldown=1.0):
+    def __init__(self, gestures_dir, window_sec=2.0, threshold=1.5, cooldown=1.0,
+                 match_interval=3):
         self.gestures_dir = gestures_dir
         self.templates = {}
         self.window_sec = window_sec
@@ -127,6 +139,9 @@ class DTWMatcher:
         self.cooldown = cooldown
         self.last_trigger_time = 0.0
         self.buffer = deque()
+        self.match_interval = match_interval  # 每 N 幀做一次 DTW
+        self._frame_count = 0
+        self._last_result = ("none", float("inf"), False, {})
         self.reload()
 
     def reload(self):
@@ -158,41 +173,34 @@ class DTWMatcher:
             self.buffer.popleft()
 
     def _compute_progress(self, live_norm, tmpl_traj):
-        """計算手勢進行百分比：比對到範本的第幾段"""
+        """計算手勢進行百分比：用最近幾幀和範本各段的歐氏距離比對（輕量版）"""
         if len(live_norm) < 3 or len(tmpl_traj) < 3:
             return 0.0
-        # 將範本切成 10 段，找到 live 最接近的段落
-        n_segments = 10
-        seg_len = max(1, len(tmpl_traj) // n_segments)
-        best_seg = 0
-        best_seg_score = float("inf")
-        # 用 live 的後半段（最近的動作）和範本的各段比對
-        live_tail = live_norm[-(len(live_norm) // 2):]
-        if len(live_tail) < 3:
-            live_tail = live_norm
-        for seg_i in range(n_segments):
-            start = seg_i * seg_len
-            end = min(start + seg_len + len(live_tail), len(tmpl_traj))
-            seg = tmpl_traj[start:end]
-            if len(seg) < 3:
-                continue
-            score = dtw_distance(live_tail, seg)
-            if score < best_seg_score:
-                best_seg_score = score
-                best_seg = seg_i
-        return (best_seg + 1) / n_segments
+        # 取 live 最後一個點，和範本的每個點比較距離，找最近的位置
+        live_pt = np.array(live_norm[-1], dtype=np.float32)
+        tmpl_arr = np.array(tmpl_traj, dtype=np.float32)
+        dists = np.sqrt(np.sum((tmpl_arr - live_pt) ** 2, axis=1))
+        best_idx = int(np.argmin(dists))
+        return (best_idx + 1) / len(tmpl_traj)
 
     def match(self):
         """回傳 (best_name, best_score, is_trigger, per_gesture_info)
         per_gesture_info = {name: {"score": f, "progress": f, "following": bool}}
+        每 match_interval 幀才做一次完整 DTW，其他幀回傳快取結果。
         """
+        self._frame_count += 1
+        if self._frame_count % self.match_interval != 0:
+            return self._last_result
+
         now = time.time()
         info = {}
         for name in self.templates:
             info[name] = {"score": float("inf"), "progress": 0.0, "following": False}
 
         if len(self.buffer) < 10 or not self.templates:
-            return "none", float("inf"), False, info
+            result = ("none", float("inf"), False, info)
+            self._last_result = result
+            return result
 
         best_name, best_score = "none", float("inf")
         for name, tmpl in self.templates.items():
@@ -201,10 +209,13 @@ class DTWMatcher:
                         for _, d in self.buffer if track in d]
             if len(live_raw) < 10:
                 continue
+            # 下採樣 live 軌跡（每 2 幀取 1）以加速 DTW
+            if len(live_raw) > 40:
+                live_raw = live_raw[::2]
             live_norm = normalize_trajectory(live_raw)
             score = dtw_distance(live_norm, tmpl["trajectory"])
             progress = self._compute_progress(live_norm, tmpl["trajectory"])
-            following = score < self.threshold * 1.5  # 寬鬆一點判斷是否在跟蹤
+            following = score < self.threshold * 1.5
             info[name] = {"score": score, "progress": progress, "following": following}
             if score < best_score:
                 best_score = score
@@ -214,7 +225,9 @@ class DTWMatcher:
                       and (now - self.last_trigger_time) > self.cooldown)
         if is_trigger:
             self.last_trigger_time = now
-        return best_name, best_score, is_trigger, info
+        result = (best_name, best_score, is_trigger, info)
+        self._last_result = result
+        return result
 
 
 # ════════════════════════════════════════════════════
@@ -608,6 +621,16 @@ def main():
     rule_det = RuleDetector() if args.rules else None
     recorder = LiveRecorder(GESTURES_DIR, args.record_duration)
 
+    # ── 執行狀態（可從 OSC 控制）──
+    state = {
+        "running": True,
+        "pose": args.pose,
+        "gesture": args.gesture,
+        "face": args.face,
+        "dtw": args.dtw,
+        "rules": args.rules,
+    }
+
     # ── OSC 接收（背景執行緒）──
     def on_cmd_record(addr, *osc_args):
         name = str(osc_args[0]) if osc_args else None
@@ -627,11 +650,54 @@ def main():
             dtw_matcher.threshold = float(osc_args[0])
             print(f"DTW threshold → {dtw_matcher.threshold}")
 
+    def on_cmd_stop(addr, *osc_args):
+        print("收到 /cmd/stop，正在關閉...")
+        state["running"] = False
+
+    def on_cmd_mode(addr, *osc_args):
+        # addr = "/cmd/mode/pose", osc_args = (1,) or (0,)
+        parts = addr.split("/")
+        if len(parts) >= 4 and osc_args:
+            mode = parts[3]  # pose / gesture / face / dtw / rules
+            val = int(osc_args[0])
+            if mode in state and mode != "running":
+                old = state[mode]
+                state[mode] = bool(val)
+                # dtw 和 rules 需要 pose
+                if mode in ("dtw", "rules") and val:
+                    state["pose"] = True
+                print(f"模式 {mode}: {old} → {state[mode]}")
+                osc.send_message(f"/mode/{mode}", val)
+
+    def on_cmd_delete(addr, *osc_args):
+        if not osc_args:
+            return
+        name = str(osc_args[0])
+        path = os.path.join(GESTURES_DIR, f"{name}.json")
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"刪除手勢: {name}")
+            if dtw_matcher:
+                dtw_matcher.reload()
+            osc.send_message("/rec/status", f"deleted:{name}")
+        else:
+            print(f"找不到手勢: {name}")
+
+    def on_cmd_list(addr, *osc_args):
+        names = list(dtw_matcher.templates.keys()) if dtw_matcher else []
+        osc.send_message("/dtw/list", names if names else ["(none)"])
+        print(f"手勢列表: {names}")
+
     disp = Dispatcher()
     disp.map("/cmd/record/stop", on_cmd_record_stop)
     disp.map("/cmd/record", on_cmd_record)
     disp.map("/cmd/reload", on_cmd_reload)
     disp.map("/cmd/threshold", on_cmd_threshold)
+    disp.map("/cmd/stop", on_cmd_stop)
+    for mode_name in ("pose", "gesture", "face", "dtw", "rules"):
+        disp.map(f"/cmd/mode/{mode_name}", on_cmd_mode)
+    disp.map("/cmd/delete", on_cmd_delete)
+    disp.map("/cmd/list", on_cmd_list)
 
     osc_server = ThreadingOSCUDPServer(("0.0.0.0", args.listen_port), disp)
     server_thread = threading.Thread(target=osc_server.serve_forever, daemon=True)
@@ -656,7 +722,7 @@ def main():
     fps_time = time.time()
     saved_flash_until = 0.0
 
-    while cap.isOpened():
+    while cap.isOpened() and state["running"]:
         ret, frame = cap.read()
         if not ret:
             break
@@ -668,7 +734,7 @@ def main():
 
         # ── 姿態 ──
         pose_result = None
-        if pose_det:
+        if pose_det and state["pose"]:
             pose_result = pose_det.detect_for_video(mp_image, timestamp_ms)
             send_pose_osc(osc, pose_result)
             if not args.no_preview:
@@ -686,7 +752,6 @@ def main():
             osc.send_message("/rec/progress", rec_value if isinstance(rec_value, float) else 0.0)
             if rec_state == "saved":
                 saved_flash_until = time.time() + 2.0
-                # 自動重新載入 DTW 範本
                 if dtw_matcher:
                     dtw_matcher.reload()
         elif recorder.state == "countdown":
@@ -694,14 +759,13 @@ def main():
             osc.send_message("/rec/status", rec_state)
 
         # ── DTW ──
-        if dtw_matcher and pose_result and pose_result.pose_landmarks and recorder.state == "idle":
+        if dtw_matcher and state["dtw"] and pose_result and pose_result.pose_landmarks and recorder.state == "idle":
             lm_dict = {}
             for idx, lm_name in DTW_TRACK_LANDMARKS.items():
                 lm = pose_result.pose_landmarks[0][idx]
                 lm_dict[lm_name] = [lm.x, lm.y]
             dtw_matcher.push_frame(time.time(), lm_dict)
             dtw_name, dtw_score, is_trigger, dtw_info = dtw_matcher.match()
-            # 每個手勢獨立的 trigger + progress + following
             for gname, ginfo in dtw_info.items():
                 if is_trigger and gname == dtw_name:
                     osc.send_message(f"/dtw/{gname}", 1)
@@ -709,14 +773,13 @@ def main():
                     osc.send_message(f"/dtw/{gname}", 0)
                 osc.send_message(f"/dtw/{gname}/progress", ginfo["progress"])
                 osc.send_message(f"/dtw/{gname}/following", int(ginfo["following"]))
-            # 通用
             osc.send_message("/dtw/gesture", dtw_name)
             osc.send_message("/dtw/score", dtw_score)
             if not args.no_preview:
                 draw_dtw(frame, dtw_name, dtw_score, is_trigger)
 
         # ── 規則 ──
-        if rule_det and pose_result and pose_result.pose_landmarks:
+        if rule_det and state["rules"] and pose_result and pose_result.pose_landmarks:
             rules = rule_det.detect(pose_result.pose_landmarks[0])
             for name, val in rules.items():
                 osc.send_message(f"/rule/{name}", val)
@@ -724,14 +787,14 @@ def main():
                 draw_rules(frame, rules)
 
         # ── 靜態手勢 ──
-        if gesture_det:
+        if gesture_det and state["gesture"]:
             gesture_result = gesture_det.recognize_for_video(mp_image, timestamp_ms)
             send_gesture_osc(osc, gesture_result)
             if not args.no_preview:
                 draw_gesture(frame, gesture_result)
 
         # ── 臉部 ──
-        if face_det:
+        if face_det and state["face"]:
             face_result = face_det.detect_for_video(mp_image, timestamp_ms)
             send_face_osc(osc, face_result)
             if not args.no_preview:

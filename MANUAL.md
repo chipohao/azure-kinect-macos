@@ -175,6 +175,44 @@ python kinect-osc.py --pose --dtw --rules
 
 ---
 
+## 遠端控制指令（從 Max/TD 送到 port 9001）
+
+| OSC 指令 | 說明 |
+|----------|------|
+| `/cmd/record <name>` | 錄製手勢（倒數 3 秒 → 錄 3 秒） |
+| `/cmd/record <name> <sec>` | 指定錄製秒數 |
+| `/cmd/record/stop` | 提前停止錄製 |
+| `/cmd/reload` | 重新載入 DTW 範本 |
+| `/cmd/threshold <float>` | 調整 DTW 閾值（預設 1.5，越小越嚴格） |
+| `/cmd/mode/pose <0\|1>` | 即時開關骨架追蹤 |
+| `/cmd/mode/gesture <0\|1>` | 即時開關靜態手勢 |
+| `/cmd/mode/face <0\|1>` | 即時開關臉部追蹤 |
+| `/cmd/mode/dtw <0\|1>` | 即時開關 DTW 手勢辨識 |
+| `/cmd/mode/rules <0\|1>` | 即時開關規則姿態 |
+| `/cmd/delete <name>` | 刪除手勢範本 |
+| `/cmd/list` | 查詢已載入的手勢（回覆送到 `/dtw/list`） |
+| `/cmd/stop` | 優雅關閉程式 |
+
+**Max 切換模式範例：**
+```
+[message /cmd/mode/dtw 0]       ← 關閉 DTW
+    |
+[udpsend 127.0.0.1 9001]
+
+[message /cmd/mode/face 1]      ← 開啟臉部追蹤
+    |
+[udpsend 127.0.0.1 9001]
+```
+
+**Max 關閉程式範例：**
+```
+[message /cmd/stop]
+    |
+[udpsend 127.0.0.1 9001]
+```
+
+---
+
 ## 臉部追蹤 (`--face`)
 
 | OSC 地址 | 部位 |

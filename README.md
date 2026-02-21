@@ -149,12 +149,14 @@ MediaPipe 內建 7 種手型辨識：`Open_Palm`, `Closed_Fist`, `Pointing_Up`, 
 
 | OSC 地址 | 值 | 說明 |
 |----------|-----|------|
-| `/dtw/wave` | 0 / 1 | wave 觸發（每個錄製的手勢都有獨立 path） |
-| `/dtw/circle` | 0 / 1 | circle 觸發 |
+| `/dtw/{name}` | 0 / 1 | 該手勢是否觸發（每個錄製的手勢都有獨立 path） |
+| `/dtw/{name}/progress` | 0.0~1.0 | 手勢進行百分比（類似 GVF） |
+| `/dtw/{name}/following` | 0 / 1 | 是否正在跟蹤此手勢 |
 | `/dtw/gesture` | string | 目前最接近的手勢名 或 "none" |
 | `/dtw/score` | float | DTW 距離（越小越像） |
+| `/dtw/list` | string... | `/cmd/list` 的回應 |
 
-**每個你錄製的手勢都會自動產生 `/dtw/{名稱}` 的 OSC 路徑。**
+**每個你錄製的手勢都會自動產生 `/dtw/{名稱}` 的 OSC 路徑。** 例如錄了 `wave` 和 `circle`，就會有 `/dtw/wave`、`/dtw/wave/progress`、`/dtw/circle`、`/dtw/circle/progress` 等。
 
 ### 臉部 `--face`
 
@@ -198,6 +200,14 @@ Python 在 **port 9001** 接收來自 Max 的控制指令。
 | `/cmd/record/stop` | 提前停止錄製 |
 | `/cmd/reload` | 重新載入所有 DTW 範本 |
 | `/cmd/threshold 1.2` | 調整 DTW 觸發閾值（越小越嚴格，預設 1.5） |
+| `/cmd/mode/pose 1` | 即時開啟/關閉骨架追蹤（0=關, 1=開） |
+| `/cmd/mode/gesture 1` | 即時開啟/關閉靜態手勢 |
+| `/cmd/mode/face 1` | 即時開啟/關閉臉部追蹤 |
+| `/cmd/mode/dtw 1` | 即時開啟/關閉 DTW 手勢辨識 |
+| `/cmd/mode/rules 1` | 即時開啟/關閉規則姿態 |
+| `/cmd/delete wave` | 刪除手勢範本 "wave" |
+| `/cmd/list` | 回傳已載入的手勢列表（收 `/dtw/list`） |
+| `/cmd/stop` | 優雅關閉程式 |
 
 ### Python → Max（收 port 9000）
 
